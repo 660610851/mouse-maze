@@ -1,0 +1,329 @@
+import pygame
+import sys
+import random
+import time
+import math
+
+# ── Constants ──────────────────────────────────────────────────────────────
+COLS, ROWS = 30, 30
+CELL = 20          # px per cell (16 cm in real life)
+W = COLS * CELL
+H = ROWS * CELL
+INFO_H = 130       # panel below maze
+
+N, S, E, Wdir = 1, 2, 4, 8
+OPP  = {N: S, S: N, E: Wdir, Wdir: E}
+DX   = {N: 0, S: 0, E: 1, Wdir: -1}
+DY   = {N: -1, S: 1, E: 0, Wdir: 0}
+DIR_ARROW = {N: "^", S: "v", E: ">", Wdir: "<"}
+DIR_NAME  = {N: "N", S: "S", E: "E", Wdir: "W"}
+
+# Colours
+BG        = (250, 250, 248)
+WALL_C    = (44,  44,  42)
+MOUSE_C   = (186, 117, 23)
+MOUSE_DEAD= (226, 75,  74)
+START_C   = (24,  95,  165)
+END_C     = (163, 45,  45)
+FOOT_C    = (99,  153, 34, 80)   # with alpha
+PANEL_C   = (241, 239, 232)
+TEXT_C    = (44,  44,  42)
+MUTED_C   = (95,  94,  90)
+WARN_C    = (186, 117, 23)
+DEAD_C    = (163, 45,  45)
+WIN_C     = (59,  109, 17)
+BORDER_C  = (136, 135, 128)
+
+TIMER_TOTAL = 180   # seconds
+
+
+# ── Maze generation (Recursive Backtracker) ────────────────────────────────
+def make_maze(seed: int):
+    rng = random.Random(seed)
+    grid = [[0] * COLS for _ in range(ROWS)]
+    vis  = [[False] * COLS for _ in range(ROWS)]
+    comp_count = [0]
+
+    def carve(x, y):
+        vis[y][x] = True
+        dirs = [N, S, E, Wdir]
+        rng.shuffle(dirs)
+        for d in dirs:
+            comp_count[0] += 1
+            nx, ny = x + DX[d], y + DY[d]
+            if 0 <= nx < COLS and 0 <= ny < ROWS and not vis[ny][nx]:
+                grid[y][x] |= d
+                grid[ny][nx] |= OPP[d]
+                carve(nx, ny)
+
+    sys.setrecursionlimit(10000)
+    carve(0, 0)
+
+    dead_ends = sum(
+        1 for y in range(ROWS) for x in range(COLS)
+        if bin(grid[y][x]).count("1") == 1
+    )
+    return grid, comp_count[0], dead_ends
+
+
+# ── Mouse AI (greedy smell + DFS backtrack) ────────────────────────────────
+class MouseAI:
+    def __init__(self):
+        self.visited = [[False] * COLS for _ in range(ROWS)]
+        self.stack   = []   # list of (x, y, remaining_dirs)
+        self.pending_turn = None   # direction to face before moving
+
+    def decide(self, mouse, grid) -> int:
+        """Return next direction (may be a turn or a move)."""
+        x, y = mouse["x"], mouse["y"]
+        self.visited[y][x] = True
+
+        avail  = [d for d in [N, S, E, Wdir] if grid[y][x] & d]
+        fresh  = [d for d in avail if not self.visited[y + DY[d]][x + DX[d]]]
+
+        def smell_dist(d):
+            return abs(x + DX[d] - (COLS-1)) + abs(y + DY[d] - (ROWS-1))
+
+        if fresh:
+            fresh.sort(key=smell_dist)
+            if len(fresh) > 1:
+                self.stack.append((x, y, fresh[1:]))
+            return fresh[0]
+
+        # backtrack
+        while self.stack:
+            jx, jy, rest = self.stack[-1]
+            rem = [d for d in rest if not self.visited[jy + DY[d]][jx + DX[d]]]
+            if not rem:
+                self.stack.pop()
+                continue
+            self.stack[-1] = (jx, jy, rem)
+            if jx == x and jy == y:
+                return rem[0]
+            # walk toward junction
+            bt = [d for d in avail
+                  if abs(x+DX[d]-jx)+abs(y+DY[d]-jy) < abs(x-jx)+abs(y-jy)]
+            return bt[0] if bt else avail[0]
+
+        # fallback: greedy
+        avail.sort(key=smell_dist)
+        return avail[0] if avail else N
+
+
+# ── Main game class ────────────────────────────────────────────────────────
+class MazeGame:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((W, H + INFO_H))
+        pygame.display.set_caption("Maze – Blind Mouse")
+        self.clock  = pygame.time.Clock()
+        self.font_sm = pygame.font.SysFont("monospace", 13)
+        self.font_md = pygame.font.SysFont("monospace", 15, bold=True)
+        self.font_lg = pygame.font.SysFont("monospace", 20, bold=True)
+
+        self.seed = 42
+        self.new_game(self.seed)
+
+    # ── Setup ──────────────────────────────────────────────────────────────
+    def new_game(self, seed):
+        t0 = time.perf_counter()
+        self.grid, self.comp, self.dead_ends = make_maze(seed)
+        self.gen_ms = (time.perf_counter() - t0) * 1000
+
+        self.footprints = []
+        self.mouse  = {"x": 0, "y": 0, "facing": E}
+        self.steps  = 0
+        self.timer  = TIMER_TOTAL
+        self.last_tick = time.time()
+        self.state  = "playing"   # playing / dead / won
+        self.status_msg = ""
+
+        self.auto   = False
+        self.ai     = MouseAI()
+        self.ai_timer = 0.0   # accumulate dt for AI steps
+
+        # foot surface with alpha
+        self.foot_surf = pygame.Surface((CELL-3, CELL-3), pygame.SRCALPHA)
+        self.foot_surf.fill(FOOT_C)
+
+    # ── Draw helpers ───────────────────────────────────────────────────────
+    def draw_cell_dot(self, x, y, color, label, font):
+        cx = x * CELL + CELL // 2
+        cy = y * CELL + CELL // 2
+        pygame.draw.circle(self.screen, color, (cx, cy), CELL // 2 - 1)
+        txt = font.render(label, True, (255, 255, 255))
+        r = txt.get_rect(center=(cx, cy))
+        self.screen.blit(txt, r)
+
+    def draw_maze(self):
+        self.screen.fill(BG)
+
+        # footprints
+        for (fx, fy) in self.footprints:
+            self.screen.blit(self.foot_surf, (fx*CELL+2, fy*CELL+2))
+
+        # walls
+        for y in range(ROWS):
+            for x in range(COLS):
+                v  = self.grid[y][x]
+                px, py = x * CELL, y * CELL
+                if not (v & N):
+                    pygame.draw.line(self.screen, WALL_C, (px, py), (px+CELL, py))
+                if not (v & S):
+                    pygame.draw.line(self.screen, WALL_C, (px, py+CELL), (px+CELL, py+CELL))
+                if not (v & Wdir):
+                    pygame.draw.line(self.screen, WALL_C, (px, py), (px, py+CELL))
+                if not (v & E):
+                    pygame.draw.line(self.screen, WALL_C, (px+CELL, py), (px+CELL, py+CELL))
+
+        # border
+        pygame.draw.rect(self.screen, WALL_C, (0, 0, W, H), 2)
+
+        # Start & End
+        self.draw_cell_dot(0, 0, START_C, "S", self.font_sm)
+        self.draw_cell_dot(COLS-1, ROWS-1, END_C, "C", self.font_sm)
+
+        # Mouse
+        mc = MOUSE_DEAD if self.state == "dead" else MOUSE_C
+        label = "X" if self.state == "dead" else DIR_ARROW[self.mouse["facing"]]
+        self.draw_cell_dot(self.mouse["x"], self.mouse["y"], mc, label, self.font_md)
+
+    def draw_info(self):
+        panel = pygame.Rect(0, H, W, INFO_H)
+        pygame.draw.rect(self.screen, PANEL_C, panel)
+        pygame.draw.line(self.screen, BORDER_C, (0, H), (W, H), 1)
+
+        # Timer colour
+        if self.timer <= 30:
+            t_col = DEAD_C
+        elif self.timer <= 60:
+            t_col = WARN_C
+        else:
+            t_col = TEXT_C
+
+        m, s = divmod(int(self.timer), 60)
+        timer_str = f"{m}:{s:02d}"
+
+        smell_d = abs(self.mouse["x"] - (COLS-1)) + abs(self.mouse["y"] - (ROWS-1))
+        if smell_d == 0:
+            smell_str = "Cheese here!"
+        elif smell_d <= 3:
+            smell_str = f"[R] very strong ({smell_d})"
+        elif smell_d <= 8:
+            smell_str = f"[O] strong ({smell_d})"
+        elif smell_d <= 15:
+            smell_str = f"[Y] medium ({smell_d})"
+        else:
+            smell_str = f"[G] faint ({smell_d})"
+
+        dir_str = DIR_NAME[self.mouse["facing"]]
+        auto_str = "AUTO ON" if self.auto else "manual"
+
+        lines = [
+            (f"Time: {timer_str}",          t_col,   16, 10),
+            (f"Steps: {self.steps}",         TEXT_C,  16, 28),
+            (f"Facing: {dir_str}  {auto_str}", MUTED_C, 16, 46),
+            (f"Smell: {smell_str}",          TEXT_C,  16, 64),
+            (f"Comp steps: {self.comp:,}  |  Dead ends: {self.dead_ends}  |  Gen: {self.gen_ms:.1f}ms  |  Seed: {self.seed}",
+                                             MUTED_C, 16, 82),
+            (f"[←↑→↓/WASD] move  [SPACE] auto  [R] reset  [N] new maze",
+                                             MUTED_C, 16, 100),
+        ]
+
+        if self.status_msg:
+            sc = WIN_C if self.state == "won" else DEAD_C
+            lines.append((self.status_msg, sc, 16, 114))
+
+        for (text, color, x, yo) in lines:
+            surf = self.font_sm.render(text, True, color)
+            self.screen.blit(surf, (x, H + yo))
+
+    # ── Game logic ─────────────────────────────────────────────────────────
+    def try_move(self, direction):
+        if self.state != "playing":
+            return
+        m = self.mouse
+        if m["facing"] != direction:
+            m["facing"] = direction
+            return
+        x, y = m["x"], m["y"]
+        if self.grid[y][x] & direction:
+            self.footprints.append((x, y))
+            m["x"] += DX[direction]
+            m["y"] += DY[direction]
+            self.steps += 1
+            if m["x"] == COLS-1 and m["y"] == ROWS-1:
+                self.state = "won"
+                self.status_msg = f"Mouse found the cheese! ({self.steps} steps)"
+                self.auto = False
+
+    def update_timer(self):
+        if self.state != "playing":
+            return
+        now = time.time()
+        dt = now - self.last_tick
+        self.last_tick = now
+        self.timer -= dt
+        if self.timer <= 0:
+            self.timer = 0
+            self.state = "dead"
+            self.status_msg = "Mouse took too long... dead!"
+            self.auto = False
+
+    def update_ai(self, dt):
+        if not self.auto or self.state != "playing":
+            return
+        self.ai_timer += dt
+        step_interval = 0.06  # seconds per AI action
+        while self.ai_timer >= step_interval and self.state == "playing":
+            self.ai_timer -= step_interval
+            direction = self.ai.decide(self.mouse, self.grid)
+            self.try_move(direction)
+
+    # ── Main loop ──────────────────────────────────────────────────────────
+    def run(self):
+        KEY_DIR = {
+            pygame.K_UP: N, pygame.K_w: N,
+            pygame.K_DOWN: S, pygame.K_s: S,
+            pygame.K_RIGHT: E, pygame.K_d: E,
+            pygame.K_LEFT: Wdir, pygame.K_a: Wdir,
+        }
+
+        while True:
+            dt = self.clock.tick(60) / 1000.0
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit(); sys.exit()
+
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in KEY_DIR:
+                        self.auto = False
+                        self.try_move(KEY_DIR[event.key])
+
+                    elif event.key == pygame.K_SPACE:
+                        if self.state == "playing":
+                            self.auto = not self.auto
+                            if self.auto:
+                                self.ai = MouseAI()
+                                self.ai_timer = 0.0
+
+                    elif event.key == pygame.K_r:
+                        self.new_game(self.seed)
+
+                    elif event.key == pygame.K_n:
+                        self.seed = random.randint(1, 999)
+                        self.new_game(self.seed)
+
+                    elif event.key == pygame.K_ESCAPE:
+                        pygame.quit(); sys.exit()
+
+            self.update_timer()
+            self.update_ai(dt)
+            self.draw_maze()
+            self.draw_info()
+            pygame.display.flip()
+
+
+if __name__ == "__main__":
+    MazeGame().run()
